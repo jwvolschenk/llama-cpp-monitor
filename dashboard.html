@@ -111,6 +111,12 @@
   }
   .cost-table td:first-child { text-align: left; padding-left: 0; color: var(--text-dim); }
   .cost-table td.zar { font-weight: 600; color: var(--orange); }
+  .cost-table tr.local-row td:first-child { color: var(--text); font-weight: 500; }
+  .cost-table td.zar.local { color: var(--green); }
+  .cost-table tr.cost-sep td {
+    padding: 4px 0; border-bottom: none;
+    border-top: 1px solid var(--border);
+  }
 
   /* Charts */
   .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 16px; margin-bottom: 24px; }
@@ -205,7 +211,7 @@
     <div><span class="value" id="m-gpu-temp">—</span><span class="unit">°C</span></div>
   </div>
   <div class="card cost-card orange" id="card-frontier-cost">
-    <div class="label">Frontier API Cost (hypothetical)</div>
+    <div class="label">Cost Comparison</div>
     <table class="cost-table" id="frontier-cost-table">
       <thead>
         <tr>
@@ -218,7 +224,7 @@
         <tr><td colspan="3">loading…</td></tr>
       </tbody>
     </table>
-    <div class="sub" id="m-frontier-cost-sub">@ R17/$ · list API rates, no cache/batch</div>
+    <div class="sub" id="m-frontier-cost-sub">local @ R2/kWh · frontier @ R17/$</div>
   </div>
 </div>
 
@@ -359,6 +365,14 @@ function fmtZar(n) {
 
 const FRONTIER_MODEL_ORDER = ['haiku_4_5', 'sonnet_5', 'gpt_5_5', 'fable_5', 'grok_4_5'];
 
+function frontierModelOrder(costs) {
+  const cum = costs.cumulative || {};
+  if (costs.cumulative_order?.length) return costs.cumulative_order;
+  return [...FRONTIER_MODEL_ORDER].sort(
+    (a, b) => (cum[b]?.zar || 0) - (cum[a]?.zar || 0),
+  );
+}
+
 // -----------------------------------------------------------------------
 // Value hold: keep last non-zero value visible for 20 seconds
 // -----------------------------------------------------------------------
@@ -488,13 +502,29 @@ async function refresh() {
     document.getElementById('m-avg-decode-sub').textContent =
       avgs.decode_active_seconds ? `${fmt(avgs.decode_active_seconds)}s active / ${fmt(avgs.window_seconds)}s window` : 'no data yet';
 
-    // --- Frontier model cost comparison ---
+    // --- Cost comparison: local electricity + frontier API (sorted high→low) ---
     const costs = status.cost_comparison || {};
     const cum = costs.cumulative || {};
     const h24 = costs.last_24h || {};
     const costBody = document.getElementById('frontier-cost-body');
-    const hasCostData = (costs.tokens_total?.prompt || 0) + (costs.tokens_total?.generated || 0) > 0;
-    costBody.innerHTML = FRONTIER_MODEL_ORDER.map(key => {
+    const localElec = costs.local_electricity || {};
+    const localCum = localElec.cumulative || {};
+    const local24 = localElec.last_24h || {};
+    const hasCostData = (costs.tokens_total?.prompt || 0) + (costs.tokens_total?.generated || 0) > 0
+      || (localCum.wh || 0) > 0;
+    const modelOrder = frontierModelOrder(costs);
+    let costRows = '';
+    if (localElec.label) {
+      costRows += `<tr class="local-row">
+        <td>${localElec.label}</td>
+        <td class="zar local">${fmtZar(localCum.zar)}</td>
+        <td class="zar local">${fmtZar(local24.zar)}</td>
+      </tr>`;
+      if (modelOrder.length) {
+        costRows += '<tr class="cost-sep"><td colspan="3"></td></tr>';
+      }
+    }
+    costRows += modelOrder.map(key => {
       const c = cum[key] || {};
       const d24 = h24[key] || {};
       return `<tr>
@@ -503,15 +533,17 @@ async function refresh() {
         <td class="zar">${fmtZar(d24.zar)}</td>
       </tr>`;
     }).join('');
+    costBody.innerHTML = costRows || '<tr><td colspan="3">no data yet</td></tr>';
     const costCard = document.getElementById('card-frontier-cost');
     costCard.className = 'card cost-card' + (hasCostData ? ' orange' : ' dim');
     const rate = costs.usd_to_zar || 17;
+    const kwhRate = costs.zar_per_kwh || localElec.zar_per_kwh || 2;
     const tok = costs.tokens_total || {};
     const tok24 = costs.tokens_24h || {};
     document.getElementById('m-frontier-cost-sub').textContent =
       hasCostData
-        ? `@ R${rate}/$ · ${fmt(tok.prompt)} in / ${fmt(tok.generated)} out · 24h ${fmt(tok24.prompt)} / ${fmt(tok24.generated)}`
-        : `@ R${rate}/$ · list API rates, no cache/batch`;
+        ? `local @ R${kwhRate}/kWh (${fmt(localCum.kwh, 3)} kWh total) · frontier @ R${rate}/$ · ${fmt(tok.prompt)} in / ${fmt(tok.generated)} out`
+        : `local @ R${kwhRate}/kWh · frontier @ R${rate}/$ · list API rates, no cache/batch`;
 
     // GPU
     const g = status.gpu || {};

@@ -33,6 +33,10 @@ Edit `.env` — at minimum set `LLAMA_API_KEY` if your llama-server requires aut
 | `HISTORY_MAX`      | `300`       | Chart data points (5 min @ 1s)                   |
 | `HISTORY_HOUR_MAX` | `3600`      | Hourly avg window (1h @ 1s)                      |
 | `HISTORY_24H_MAX`  | `86400`     | 24h generated-token window (24h @ 1s)            |
+| `USD_TO_ZAR`       | `17`        | Exchange rate for frontier API cost comparison   |
+| `ZAR_PER_KWH`      | `2`         | Local GPU electricity rate (ZAR per kWh)         |
+| `STATE_FILE`       | `data/monitor_state.json` | Persisted session token/energy totals |
+| `STATE_SAVE_INTERVAL` | `30`     | Seconds between state file writes                |
 
 `monitor.py` loads `.env` from the project directory on startup (stdlib dotenv loader — no `python-dotenv` package).
 

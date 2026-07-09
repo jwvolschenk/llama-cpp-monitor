@@ -65,6 +65,12 @@ HISTORY_24H_MAX = int(os.environ.get("HISTORY_24H_MAX", "86400"))  # 24 hours @ 
 MONITOR_PORT = int(os.environ.get("MONITOR_PORT", "8100"))
 GPU_INDEX = int(os.environ.get("GPU_INDEX", "1"))                # RTX 5060 Ti
 USD_TO_ZAR = float(os.environ.get("USD_TO_ZAR", "17"))           # Rand per USD
+ZAR_PER_KWH = float(os.environ.get("ZAR_PER_KWH", "2"))          # local GPU electricity
+STATE_FILE = Path(os.environ.get(
+    "STATE_FILE",
+    str(Path(__file__).parent / "data" / "monitor_state.json"),
+))
+STATE_SAVE_INTERVAL = int(os.environ.get("STATE_SAVE_INTERVAL", "30"))  # seconds
 
 # Frontier model API pricing (USD per 1M tokens: input, output).
 # Standard list rates as of mid-2026; no cache/batch discounts applied.
@@ -90,6 +96,8 @@ prev_req_processing: int = 0  # for detecting request completions
 requests_processed_total: int = 0  # running count of completed requests
 prompt_tokens_total: int = 0  # cumulative prompt tokens since monitor start
 gen_tokens_total: int = 0  # cumulative generated tokens since monitor start
+energy_wh_total: float = 0.0  # cumulative GPU energy (watt-hours) since monitor start
+last_state_save: float = 0.0
 lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -294,6 +302,96 @@ def compute_24h_generated() -> int:
     return tokens["generated"]
 
 
+def load_persisted_state() -> None:
+    """Restore session accumulators from disk (survives monitor restarts)."""
+    global prompt_tokens_total, gen_tokens_total, requests_processed_total
+    global energy_wh_total
+    if not STATE_FILE.is_file():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        prompt_tokens_total = int(data.get("prompt_tokens_total", 0))
+        gen_tokens_total = int(data.get("gen_tokens_total", 0))
+        requests_processed_total = int(data.get("requests_processed_total", 0))
+        energy_wh_total = float(data.get("energy_wh_total", 0))
+        print(
+            f"[monitor] loaded state: {prompt_tokens_total} prompt / "
+            f"{gen_tokens_total} generated tokens, "
+            f"{energy_wh_total:.1f} Wh energy",
+        )
+    except Exception as e:
+        print(f"[monitor] warning: could not load {STATE_FILE}: {e}")
+
+
+def save_persisted_state() -> None:
+    """Persist session accumulators to disk."""
+    try:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "version": 1,
+            "prompt_tokens_total": prompt_tokens_total,
+            "gen_tokens_total": gen_tokens_total,
+            "requests_processed_total": requests_processed_total,
+            "energy_wh_total": round(energy_wh_total, 4),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except Exception as e:
+        print(f"[monitor] warning: could not save {STATE_FILE}: {e}")
+
+
+def maybe_save_persisted_state() -> None:
+    """Throttle state writes to avoid excessive disk I/O."""
+    global last_state_save
+    now = time.time()
+    if now - last_state_save >= STATE_SAVE_INTERVAL:
+        save_persisted_state()
+        last_state_save = now
+
+
+def compute_24h_energy_wh() -> float:
+    """GPU energy (watt-hours) integrated over the rolling 24h window."""
+    if len(history_24h) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(history_24h)):
+        prev = history_24h[i - 1]
+        curr = history_24h[i]
+        dt = curr["ts"] - prev["ts"]
+        if dt <= 0:
+            continue
+        power = curr.get("gpu", {}).get("power_w")
+        if power is not None:
+            total += float(power) * (dt / 3600.0)
+    return total
+
+
+def electricity_cost_zar(wh: float) -> float:
+    """Local electricity cost in ZAR for the given watt-hours."""
+    return round((wh / 1000.0) * ZAR_PER_KWH, 2)
+
+
+def compute_local_electricity() -> dict:
+    """Estimated local GPU electricity cost (not frontier API pricing)."""
+    wh_24h = compute_24h_energy_wh()
+    return {
+        "label": "Local GPU (electricity)",
+        "zar_per_kwh": ZAR_PER_KWH,
+        "cumulative": {
+            "wh": round(energy_wh_total, 2),
+            "kwh": round(energy_wh_total / 1000.0, 4),
+            "zar": electricity_cost_zar(energy_wh_total),
+        },
+        "last_24h": {
+            "wh": round(wh_24h, 2),
+            "kwh": round(wh_24h / 1000.0, 4),
+            "zar": electricity_cost_zar(wh_24h),
+        },
+    }
+
+
 def compute_24h_token_totals() -> dict:
     """Prompt and generated token totals over the rolling 24h window."""
     if len(history_24h) < 2:
@@ -332,26 +430,36 @@ def compute_frontier_costs(tokens_in: int, tokens_out: int) -> dict:
 
 
 def compute_cost_comparison() -> dict:
-    """Cumulative and 24h hypothetical frontier-model costs in ZAR."""
+    """Cumulative and 24h costs: local electricity + hypothetical frontier APIs."""
     tokens_24h = compute_24h_token_totals()
+    cumulative = compute_frontier_costs(prompt_tokens_total, gen_tokens_total)
+    last_24h = compute_frontier_costs(
+        tokens_24h["prompt"], tokens_24h["generated"],
+    )
+    cumulative_order = sorted(
+        cumulative.keys(),
+        key=lambda k: cumulative[k]["zar"],
+        reverse=True,
+    )
     return {
         "usd_to_zar": USD_TO_ZAR,
+        "zar_per_kwh": ZAR_PER_KWH,
         "tokens_total": {
             "prompt": prompt_tokens_total,
             "generated": gen_tokens_total,
         },
         "tokens_24h": tokens_24h,
-        "cumulative": compute_frontier_costs(prompt_tokens_total, gen_tokens_total),
-        "last_24h": compute_frontier_costs(
-            tokens_24h["prompt"], tokens_24h["generated"],
-        ),
+        "cumulative": cumulative,
+        "last_24h": last_24h,
+        "cumulative_order": cumulative_order,
+        "local_electricity": compute_local_electricity(),
     }
 
 
 def collector_loop():
     global current_status, props_cache, props_fetched, prev_snapshot
     global prev_req_processing, requests_processed_total
-    global prompt_tokens_total, gen_tokens_total
+    global prompt_tokens_total, gen_tokens_total, energy_wh_total
     while True:
         try:
             snap = collect_once()
@@ -381,6 +489,13 @@ def collector_loop():
             prompt_tokens_total += deltas.get("delta_prompt_tokens", 0)
             gen_tokens_total += deltas.get("delta_gen_tokens", 0)
 
+            dt_energy = snap["ts"] - prev_snapshot["ts"] if prev_snapshot else POLL_INTERVAL
+            if dt_energy <= 0:
+                dt_energy = POLL_INTERVAL
+            power_w = snap.get("gpu", {}).get("power_w")
+            if power_w is not None:
+                energy_wh_total += float(power_w) * (dt_energy / 3600.0)
+
             with lock:
                 current_status = snap
                 history.append(snap)
@@ -391,6 +506,8 @@ def collector_loop():
                 current_status["cost_comparison"] = compute_cost_comparison()
                 current_status["requests_processed_total"] = requests_processed_total
                 current_status["delta_requests_processed"] = delta_req
+
+            maybe_save_persisted_state()
 
             prev_snapshot = snap
 
@@ -479,6 +596,7 @@ class MonitorHandler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    load_persisted_state()
     t = threading.Thread(target=collector_loop, daemon=True)
     t.start()
     print(f"[monitor] collecting from {LLAMA_URL} every {POLL_INTERVAL}s")
@@ -489,6 +607,7 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[monitor] shutting down")
+        save_persisted_state()
         server.shutdown()
 
 
