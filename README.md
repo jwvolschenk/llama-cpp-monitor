@@ -6,8 +6,11 @@ No external Python dependencies — stdlib only. Chart.js loaded from CDN.
 ## Quick Start
 
 ```bash
+cp .env.example .env
+# Edit .env — set LLAMA_API_KEY if your llama-server requires auth
+
 python3 monitor.py
-# Dashboard at http://localhost:8090
+# Dashboard at http://localhost:8100 (or MONITOR_PORT from .env)
 ```
 
 ## As a systemd user service
@@ -31,8 +34,8 @@ systemctl --user status llama-monitor
 |-----------------|------------------------|-----------------------------------|
 | `LLAMA_HOST`    | `localhost`            | llama.cpp server host             |
 | `LLAMA_PORT`    | `8080`                 | llama.cpp server port             |
-| `LLAMA_API_KEY` | (from start-server.sh) | API key for metrics endpoint      |
-| `MONITOR_PORT`  | `8090`                 | Port for this dashboard           |
+| `LLAMA_API_KEY` | (none)                 | API key for metrics endpoint (set in `.env`) |
+| `MONITOR_PORT`  | `8100`                 | Port for this dashboard           |
 | `GPU_INDEX`     | `1`                    | nvidia-smi GPU index              |
 | `POLL_INTERVAL` | `1`                    | Seconds between metric collection |
 | `HISTORY_MAX`   | `300`                  | Chart data points (5min @ 1s)     |
@@ -59,8 +62,8 @@ systemctl --user status llama-monitor
 ## Architecture
 
 ```
- monitor.py (port 8090)
-   ├── Background thread (every 5s)
+ monitor.py (MONITOR_PORT, default 8100)
+   ├── Background thread (every POLL_INTERVAL s, default 1s)
    │     ├── GET localhost:8080/health
    │     ├── GET localhost:8080/metrics  (Prometheus format)
    │     └── nvidia-smi --id=1

@@ -6,6 +6,7 @@ After=llama-server.service
 Type=simple
 ExecStart=/usr/bin/python3 /home/jwvolschenk/repos/llama-cpp-monitor/monitor.py
 WorkingDirectory=/home/jwvolschenk/repos/llama-cpp-monitor
+EnvironmentFile=-/home/jwvolschenk/repos/llama-cpp-monitor/.env
 Environment=LLAMA_HOST=localhost
 Environment=LLAMA_PORT=8080
 Environment=MONITOR_PORT=8100

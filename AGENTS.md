@@ -170,7 +170,7 @@ Chain steps in one call with **`codedb_query`** when narrowing then reading:
 
 ## Guardrails
 
-- Do not commit or hardcode real API keys; `LLAMA_API_KEY` defaults in `monitor.py` should be treated as local-dev only.
+- Do not commit `.env` or real API keys; use `.env.example` as the template.
 - Do not add heavyweight frameworks (Flask, FastAPI, etc.) without explicit request — stdlib HTTP server is intentional.
 - Do not change poll/history defaults without updating `README.md` and any chart time-window logic in `dashboard.html`.
 - GPU stats require `nvidia-smi` on the host; handle missing GPU gracefully (existing `{"error": ...}` pattern).

@@ -32,10 +32,32 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+def load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE pairs from a .env file (stdlib only; no python-dotenv)."""
+    if not path.is_file():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv(Path(__file__).parent / ".env")
+
 LLAMA_HOST = os.environ.get("LLAMA_HOST", "localhost")
 LLAMA_PORT = os.environ.get("LLAMA_PORT", "8080")
 LLAMA_URL = f"http://{LLAMA_HOST}:{LLAMA_PORT}"
-LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "j9o5mbOYx7s1v4tc9IJQ7SOxK2I42uCtmiueQftAuLU")
+LLAMA_API_KEY = os.environ.get("LLAMA_API_KEY", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "1"))       # seconds
 HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "300"))          # 5 min @ 1s
 HISTORY_HOUR_MAX = int(os.environ.get("HISTORY_HOUR_MAX", "3600"))  # 1 hour @ 1s
