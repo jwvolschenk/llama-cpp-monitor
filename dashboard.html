@@ -63,6 +63,13 @@
   .status-dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
   .meta { font-size: 13px; color: var(--text-dim); }
 
+  .metrics-warning {
+    background: rgba(210,153,34,0.12); border: 1px solid rgba(210,153,34,0.35);
+    color: var(--orange); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px;
+    font-size: 13px; display: none;
+  }
+  .metrics-warning.visible { display: block; }
+
   /* Model info bar */
   .model-bar {
     background: var(--surface); border: 1px solid var(--border);
@@ -90,6 +97,20 @@
   .card.orange .value { color: var(--orange); }
   .card.red .value { color: var(--red); }
   .card.dim .value { color: var(--text-dim); }
+
+  /* Frontier cost comparison card */
+  .card.cost-card { grid-column: span 2; min-width: 320px; }
+  .cost-table { margin-top: 8px; width: 100%; border-collapse: collapse; font-size: 13px; }
+  .cost-table th {
+    color: var(--text-dim); font-weight: 500; text-align: right;
+    padding: 0 0 6px 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+  }
+  .cost-table th:first-child { text-align: left; padding-left: 0; }
+  .cost-table td {
+    padding: 3px 0 3px 12px; font-variant-numeric: tabular-nums; text-align: right;
+  }
+  .cost-table td:first-child { text-align: left; padding-left: 0; color: var(--text-dim); }
+  .cost-table td.zar { font-weight: 600; color: var(--orange); }
 
   /* Charts */
   .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 16px; margin-bottom: 24px; }
@@ -126,6 +147,8 @@
     </div>
   </div>
 </div>
+
+<div class="metrics-warning" id="metrics-warning"></div>
 
 <div class="model-bar" id="model-bar">
   <div class="item"><span class="k">Model:</span><span class="v" id="info-model">—</span></div>
@@ -180,6 +203,22 @@
   <div class="card" id="card-gpu-temp">
     <div class="label">GPU Temp</div>
     <div><span class="value" id="m-gpu-temp">—</span><span class="unit">°C</span></div>
+  </div>
+  <div class="card cost-card orange" id="card-frontier-cost">
+    <div class="label">Frontier API Cost (hypothetical)</div>
+    <table class="cost-table" id="frontier-cost-table">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>Total</th>
+          <th>24h</th>
+        </tr>
+      </thead>
+      <tbody id="frontier-cost-body">
+        <tr><td colspan="3">loading…</td></tr>
+      </tbody>
+    </table>
+    <div class="sub" id="m-frontier-cost-sub">@ R17/$ · list API rates, no cache/batch</div>
   </div>
 </div>
 
@@ -311,6 +350,15 @@ function fmt(n, d = 0) {
   return Number(n).toLocaleString(undefined, { maximumFractionDigits: d });
 }
 
+function fmtZar(n) {
+  if (n == null || isNaN(n)) return '—';
+  return 'R' + Number(n).toLocaleString(undefined, {
+    minimumFractionDigits: 2, maximumFractionDigits: 2,
+  });
+}
+
+const FRONTIER_MODEL_ORDER = ['haiku_4_5', 'sonnet_5', 'gpt_5_5', 'fable_5', 'grok_4_5'];
+
 // -----------------------------------------------------------------------
 // Value hold: keep last non-zero value visible for 20 seconds
 // -----------------------------------------------------------------------
@@ -378,6 +426,17 @@ async function refresh() {
     }
     document.getElementById('last-update').textContent = 'Updated ' + new Date(status.ts_iso).toLocaleTimeString();
 
+    const warn = document.getElementById('metrics-warning');
+    if (status.health_ok && status.metrics_ok === false) {
+      warn.className = 'metrics-warning visible';
+      warn.textContent = '⚠ Token metrics unavailable'
+        + (status.metrics_error ? ': ' + status.metrics_error : '')
+        + ' — set LLAMA_API_KEY in .env and restart the monitor service.';
+    } else {
+      warn.className = 'metrics-warning';
+      warn.textContent = '';
+    }
+
     // --- Metric cards (show INSTANT throughput, not lifetime average) ---
     const prefillCard = document.getElementById('card-prefill');
     const decodeCard = document.getElementById('card-decode');
@@ -425,9 +484,34 @@ async function refresh() {
     avgPreCard.className = 'card' + (avgs.avg_prefill_1h > 0 ? ' green' : ' dim');
     avgDecCard.className = 'card' + (avgs.avg_decode_1h > 0 ? ' blue' : ' dim');
     document.getElementById('m-avg-prefill-sub').textContent =
-      avgs.prefill_samples ? `${avgs.prefill_samples} samples / ${fmt(avgs.window_seconds)}s` : 'no data yet';
+      avgs.prefill_active_seconds ? `${fmt(avgs.prefill_active_seconds)}s active / ${fmt(avgs.window_seconds)}s window` : 'no data yet';
     document.getElementById('m-avg-decode-sub').textContent =
-      avgs.decode_samples ? `${avgs.decode_samples} samples / ${fmt(avgs.window_seconds)}s` : 'no data yet';
+      avgs.decode_active_seconds ? `${fmt(avgs.decode_active_seconds)}s active / ${fmt(avgs.window_seconds)}s window` : 'no data yet';
+
+    // --- Frontier model cost comparison ---
+    const costs = status.cost_comparison || {};
+    const cum = costs.cumulative || {};
+    const h24 = costs.last_24h || {};
+    const costBody = document.getElementById('frontier-cost-body');
+    const hasCostData = (costs.tokens_total?.prompt || 0) + (costs.tokens_total?.generated || 0) > 0;
+    costBody.innerHTML = FRONTIER_MODEL_ORDER.map(key => {
+      const c = cum[key] || {};
+      const d24 = h24[key] || {};
+      return `<tr>
+        <td>${c.label || key}</td>
+        <td class="zar">${fmtZar(c.zar)}</td>
+        <td class="zar">${fmtZar(d24.zar)}</td>
+      </tr>`;
+    }).join('');
+    const costCard = document.getElementById('card-frontier-cost');
+    costCard.className = 'card cost-card' + (hasCostData ? ' orange' : ' dim');
+    const rate = costs.usd_to_zar || 17;
+    const tok = costs.tokens_total || {};
+    const tok24 = costs.tokens_24h || {};
+    document.getElementById('m-frontier-cost-sub').textContent =
+      hasCostData
+        ? `@ R${rate}/$ · ${fmt(tok.prompt)} in / ${fmt(tok.generated)} out · 24h ${fmt(tok24.prompt)} / ${fmt(tok24.generated)}`
+        : `@ R${rate}/$ · list API rates, no cache/batch`;
 
     // GPU
     const g = status.gpu || {};

@@ -64,6 +64,17 @@ HISTORY_HOUR_MAX = int(os.environ.get("HISTORY_HOUR_MAX", "3600"))  # 1 hour @ 1
 HISTORY_24H_MAX = int(os.environ.get("HISTORY_24H_MAX", "86400"))  # 24 hours @ 1s
 MONITOR_PORT = int(os.environ.get("MONITOR_PORT", "8100"))
 GPU_INDEX = int(os.environ.get("GPU_INDEX", "1"))                # RTX 5060 Ti
+USD_TO_ZAR = float(os.environ.get("USD_TO_ZAR", "17"))           # Rand per USD
+
+# Frontier model API pricing (USD per 1M tokens: input, output).
+# Standard list rates as of mid-2026; no cache/batch discounts applied.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "haiku_4_5": {"label": "Haiku 4.5", "input": 1.0, "output": 5.0},
+    "sonnet_5": {"label": "Sonnet 5", "input": 2.0, "output": 10.0},
+    "gpt_5_5": {"label": "GPT 5.5", "input": 5.0, "output": 30.0},
+    "fable_5": {"label": "Fable 5", "input": 10.0, "output": 50.0},
+    "grok_4_5": {"label": "Grok 4.5", "input": 2.0, "output": 6.0},
+}
 
 # ---------------------------------------------------------------------------
 # State
@@ -77,32 +88,44 @@ props_fetched: bool = False
 prev_snapshot: dict = {}   # previous raw snapshot for delta computation
 prev_req_processing: int = 0  # for detecting request completions
 requests_processed_total: int = 0  # running count of completed requests
+prompt_tokens_total: int = 0  # cumulative prompt tokens since monitor start
+gen_tokens_total: int = 0  # cumulative generated tokens since monitor start
 lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Data collection
 # ---------------------------------------------------------------------------
 
+def _auth_request(url: str, timeout: float = 3.0) -> tuple[bytes | None, str | None]:
+    """HTTP GET with optional API key. Returns (body, error)."""
+    req = urllib.request.Request(url)
+    if LLAMA_API_KEY:
+        req.add_header("Authorization", f"Bearer {LLAMA_API_KEY}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(), None
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:120]
+        return None, f"HTTP {e.code}: {detail}"
+    except Exception as e:
+        return None, str(e)
+
+
 def fetch_json(url: str, timeout: float = 3.0) -> dict | None:
-    req = urllib.request.Request(url)
-    if LLAMA_API_KEY:
-        req.add_header("Authorization", f"Bearer {LLAMA_API_KEY}")
+    body, err = _auth_request(url, timeout)
+    if err or body is None:
+        return None
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+        return json.loads(body.decode())
     except Exception:
         return None
 
 
-def fetch_metrics_raw(url: str, timeout: float = 3.0) -> str | None:
-    req = urllib.request.Request(url)
-    if LLAMA_API_KEY:
-        req.add_header("Authorization", f"Bearer {LLAMA_API_KEY}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode()
-    except Exception:
-        return None
+def fetch_metrics_raw(url: str, timeout: float = 3.0) -> tuple[str | None, str | None]:
+    body, err = _auth_request(url, timeout)
+    if err:
+        return None, err
+    return body.decode() if body is not None else None, None
 
 
 def parse_prometheus_metrics(text: str) -> dict:
@@ -159,14 +182,21 @@ def collect_once() -> dict:
     ts = time.time()
     health = fetch_json(f"{LLAMA_URL}/health")
     health_ok = health is not None and health.get("status") == "ok"
-    raw_metrics = fetch_metrics_raw(f"{LLAMA_URL}/metrics")
+    raw_metrics, metrics_error = fetch_metrics_raw(f"{LLAMA_URL}/metrics")
     metrics = parse_prometheus_metrics(raw_metrics) if raw_metrics else {}
+    metrics_ok = bool(metrics)
+    if health_ok and not metrics_ok and not metrics_error:
+        metrics_error = "empty /metrics response"
+    elif health_ok and not metrics_ok and not LLAMA_API_KEY:
+        metrics_error = "LLAMA_API_KEY not set (required for /metrics)"
     gpu = get_gpu_stats()
 
     return {
         "ts": ts,
         "ts_iso": datetime.now(timezone.utc).isoformat(),
         "health_ok": health_ok,
+        "metrics_ok": metrics_ok,
+        "metrics_error": metrics_error,
         "health": health or {"status": "unreachable"},
         "metrics": metrics,
         "gpu": gpu,
@@ -218,9 +248,11 @@ def compute_deltas(prev: dict, curr: dict) -> dict:
         # True per-request throughput (only during processing)
         "prefill_per_sec": round(prefill_per_sec, 1),
         "decode_per_sec": round(decode_per_sec, 1),
-        # Tokens this interval
+        # Tokens and processing time this interval
         "delta_prompt_tokens": int(d_prompt_tokens),
         "delta_gen_tokens": int(d_gen_tokens),
+        "delta_prompt_seconds": round(d_prompt_sec, 4),
+        "delta_gen_seconds": round(d_gen_sec, 4),
         # Activity
         "busy": busy,
         "requests_processing": int(req_processing),
@@ -231,39 +263,95 @@ def compute_deltas(prev: dict, curr: dict) -> dict:
 
 def compute_hourly_averages() -> dict:
     """Compute 1-hour rolling averages of prefill and decode throughput.
-    Only counts intervals where the model was actually processing."""
-    prefill_rates = []
-    decode_rates = []
+
+    Uses total tokens / total active processing seconds over the window,
+    so idle/downtime intervals (zero deltas) do not dilute the average."""
+    total_prompt_tokens = 0
+    total_prompt_sec = 0.0
+    total_gen_tokens = 0
+    total_gen_sec = 0.0
     for snap in history_hour:
         d = snap.get("deltas", {})
-        pp = d.get("prefill_per_sec", 0)
-        dp = d.get("decode_per_sec", 0)
-        if pp > 0:
-            prefill_rates.append(pp)
-        if dp > 0:
-            decode_rates.append(dp)
+        total_prompt_tokens += d.get("delta_prompt_tokens", 0)
+        total_prompt_sec += d.get("delta_prompt_seconds", 0)
+        total_gen_tokens += d.get("delta_gen_tokens", 0)
+        total_gen_sec += d.get("delta_gen_seconds", 0)
     return {
-        "avg_prefill_1h": round(sum(prefill_rates) / len(prefill_rates), 1) if prefill_rates else 0,
-        "avg_decode_1h": round(sum(decode_rates) / len(decode_rates), 1) if decode_rates else 0,
-        "prefill_samples": len(prefill_rates),
-        "decode_samples": len(decode_rates),
-        "window_seconds": len(history_hour),
+        "avg_prefill_1h": round(total_prompt_tokens / total_prompt_sec, 1)
+        if total_prompt_sec > 0.01 else 0,
+        "avg_decode_1h": round(total_gen_tokens / total_gen_sec, 1)
+        if total_gen_sec > 0.01 else 0,
+        "prefill_active_seconds": round(total_prompt_sec, 1),
+        "decode_active_seconds": round(total_gen_sec, 1),
+        "window_seconds": len(history_hour) * POLL_INTERVAL,
     }
 
 
 def compute_24h_generated() -> int:
     """Compute tokens generated in the last 24 hours by diffing the
     cumulative counter between the oldest and newest snapshot in the window."""
+    tokens = compute_24h_token_totals()
+    return tokens["generated"]
+
+
+def compute_24h_token_totals() -> dict:
+    """Prompt and generated token totals over the rolling 24h window."""
     if len(history_24h) < 2:
-        return 0
-    oldest = history_24h[0].get("metrics", {}).get("llamacpp:tokens_predicted_total", 0)
-    newest = history_24h[-1].get("metrics", {}).get("llamacpp:tokens_predicted_total", 0)
-    return max(0, int(newest - oldest))
+        return {"prompt": 0, "generated": 0}
+    oldest_m = history_24h[0].get("metrics", {})
+    newest_m = history_24h[-1].get("metrics", {})
+    prompt = max(
+        0,
+        int(newest_m.get("llamacpp:prompt_tokens_total", 0)
+            - oldest_m.get("llamacpp:prompt_tokens_total", 0)),
+    )
+    generated = max(
+        0,
+        int(newest_m.get("llamacpp:tokens_predicted_total", 0)
+            - oldest_m.get("llamacpp:tokens_predicted_total", 0)),
+    )
+    return {"prompt": prompt, "generated": generated}
+
+
+def model_cost_zar(tokens_in: int, tokens_out: int, input_per_m: float,
+                   output_per_m: float) -> float:
+    """Hypothetical API cost in ZAR for the given token counts."""
+    usd = (tokens_in * input_per_m + tokens_out * output_per_m) / 1_000_000
+    return round(usd * USD_TO_ZAR, 2)
+
+
+def compute_frontier_costs(tokens_in: int, tokens_out: int) -> dict:
+    """Hypothetical frontier-model API costs for prompt + output tokens."""
+    models = {}
+    for key, pricing in MODEL_PRICING.items():
+        zar = model_cost_zar(
+            tokens_in, tokens_out, pricing["input"], pricing["output"],
+        )
+        models[key] = {"label": pricing["label"], "zar": zar}
+    return models
+
+
+def compute_cost_comparison() -> dict:
+    """Cumulative and 24h hypothetical frontier-model costs in ZAR."""
+    tokens_24h = compute_24h_token_totals()
+    return {
+        "usd_to_zar": USD_TO_ZAR,
+        "tokens_total": {
+            "prompt": prompt_tokens_total,
+            "generated": gen_tokens_total,
+        },
+        "tokens_24h": tokens_24h,
+        "cumulative": compute_frontier_costs(prompt_tokens_total, gen_tokens_total),
+        "last_24h": compute_frontier_costs(
+            tokens_24h["prompt"], tokens_24h["generated"],
+        ),
+    }
 
 
 def collector_loop():
     global current_status, props_cache, props_fetched, prev_snapshot
     global prev_req_processing, requests_processed_total
+    global prompt_tokens_total, gen_tokens_total
     while True:
         try:
             snap = collect_once()
@@ -276,6 +364,7 @@ def collector_loop():
                     "instant_prefill_tps": 0, "instant_decode_tps": 0,
                     "prefill_per_sec": 0, "decode_per_sec": 0,
                     "delta_prompt_tokens": 0, "delta_gen_tokens": 0,
+                    "delta_prompt_seconds": 0, "delta_gen_seconds": 0,
                     "busy": False, "requests_processing": 0,
                     "requests_deferred": 0, "decode_calls_delta": 0,
                 }
@@ -289,6 +378,8 @@ def collector_loop():
             delta_req = max(0, prev_req_processing - curr_processing)
             requests_processed_total += delta_req
             prev_req_processing = int(curr_processing)
+            prompt_tokens_total += deltas.get("delta_prompt_tokens", 0)
+            gen_tokens_total += deltas.get("delta_gen_tokens", 0)
 
             with lock:
                 current_status = snap
@@ -297,6 +388,7 @@ def collector_loop():
                 history_24h.append(snap)
                 current_status["averages"] = compute_hourly_averages()
                 current_status["generated_24h"] = compute_24h_generated()
+                current_status["cost_comparison"] = compute_cost_comparison()
                 current_status["requests_processed_total"] = requests_processed_total
                 current_status["delta_requests_processed"] = delta_req
 
@@ -316,6 +408,8 @@ def collector_loop():
                     "ts": time.time(),
                     "ts_iso": datetime.now(timezone.utc).isoformat(),
                     "health_ok": False,
+                    "metrics_ok": False,
+                    "metrics_error": str(e),
                     "health": {"status": "error", "detail": str(e)},
                     "metrics": {},
                     "gpu": {"error": str(e)},
@@ -323,6 +417,7 @@ def collector_loop():
                         "instant_prefill_tps": 0, "instant_decode_tps": 0,
                         "prefill_per_sec": 0, "decode_per_sec": 0,
                         "delta_prompt_tokens": 0, "delta_gen_tokens": 0,
+                        "delta_prompt_seconds": 0, "delta_gen_seconds": 0,
                         "busy": False, "requests_processing": 0,
                         "requests_deferred": 0, "decode_calls_delta": 0,
                     },
@@ -330,6 +425,7 @@ def collector_loop():
             with lock:
                 current_status["averages"] = compute_hourly_averages()
                 current_status["generated_24h"] = compute_24h_generated()
+                current_status["cost_comparison"] = compute_cost_comparison()
                 current_status["requests_processed_total"] = requests_processed_total
                 current_status["delta_requests_processed"] = 0
         time.sleep(POLL_INTERVAL)
