@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# CodeDB index artifact (regenerated locally)
+codedb.snapshot
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Large model artifacts (never commit)
+*.gguf
+*.bin
+*.pt
+*.onnx

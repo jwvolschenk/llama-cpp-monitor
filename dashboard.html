@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Llama.cpp Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #e6edf3; --text-dim: #8b949e; --green: #3fb950;
+    --red: #f85149; --orange: #d29922; --blue: #58a6ff;
+    --purple: #bc8cff; --cyan: #39d2c0;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg); color: var(--text); min-height: 100vh;
+    padding: 16px 24px;
+  }
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+  }
+  .header h1 { font-size: 22px; font-weight: 600; }
+  .header h1 span { color: var(--blue); }
+  .status-group { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+  /* Busy/Idle indicator - prominent */
+  .activity-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 20px; border-radius: 20px; font-size: 15px; font-weight: 600;
+    letter-spacing: 0.5px; text-transform: uppercase;
+    transition: all 0.3s ease;
+  }
+  .activity-badge.idle {
+    background: rgba(139,148,158,0.12); color: var(--text-dim);
+    border: 1px solid rgba(139,148,158,0.25);
+  }
+  .activity-badge.busy {
+    background: rgba(63,185,80,0.15); color: var(--green);
+    border: 1px solid rgba(63,185,80,0.35);
+    animation: pulse-green 2s ease-in-out infinite;
+  }
+  @keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(63,185,80,0.3); }
+    50% { box-shadow: 0 0 12px 2px rgba(63,185,80,0.2); }
+  }
+  .activity-badge.error {
+    background: rgba(248,81,73,0.15); color: var(--red);
+    border: 1px solid rgba(248,81,73,0.3);
+  }
+
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 16px; border-radius: 20px; font-size: 13px; font-weight: 500;
+  }
+  .status-badge.ok { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.3); }
+  .status-badge.err { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.3); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+  .status-dot.ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .status-dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .meta { font-size: 13px; color: var(--text-dim); }
+
+  /* Model info bar */
+  .model-bar {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 24px;
+    display: flex; flex-wrap: wrap; gap: 20px; font-size: 13px;
+  }
+  .model-bar .item { display: flex; gap: 6px; }
+  .model-bar .item .k { color: var(--text-dim); }
+  .model-bar .item .v { color: var(--text); font-weight: 500; }
+
+  /* Cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .card .label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .card .value { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .card .unit { font-size: 14px; color: var(--text-dim); font-weight: 400; margin-left: 4px; }
+  .card .sub { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+  .card.green .value { color: var(--green); }
+  .card.blue .value { color: var(--blue); }
+  .card.purple .value { color: var(--purple); }
+  .card.cyan .value { color: var(--cyan); }
+  .card.orange .value { color: var(--orange); }
+  .card.red .value { color: var(--red); }
+  .card.dim .value { color: var(--text-dim); }
+
+  /* Charts */
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .chart-box {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .chart-box h3 { font-size: 14px; font-weight: 600; margin-bottom: 12px; color: var(--text-dim); }
+  .chart-box canvas { width: 100% !important; height: 220px !important; }
+
+  .footer { text-align: center; padding: 16px; font-size: 12px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>🦙 <span>llama.cpp</span> Monitor</h1>
+    <div class="meta" id="model-name">loading...</div>
+  </div>
+  <div class="status-group">
+    <!-- Big activity indicator -->
+    <div class="activity-badge idle" id="activity-badge">
+      <span id="activity-icon">⏸</span>
+      <span id="activity-text">IDLE</span>
+    </div>
+    <!-- Health badge -->
+    <div style="text-align:right">
+      <div class="status-badge" id="status-badge">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">connecting...</span>
+      </div>
+      <div class="meta" id="last-update">—</div>
+    </div>
+  </div>
+</div>
+
+<div class="model-bar" id="model-bar">
+  <div class="item"><span class="k">Model:</span><span class="v" id="info-model">—</span></div>
+  <div class="item"><span class="k">Context:</span><span class="v" id="info-ctx">—</span></div>
+  <div class="item"><span class="k">Slots:</span><span class="v" id="info-slots">—</span></div>
+  <div class="item"><span class="k">GPU:</span><span class="v" id="info-gpu">—</span></div>
+  <div class="item"><span class="k">VRAM:</span><span class="v" id="info-vram">—</span></div>
+</div>
+
+<!-- Metric cards -->
+<div class="cards">
+  <div class="card" id="card-prefill">
+    <div class="label">Prefill Throughput</div>
+    <div><span class="value" id="m-prefill">0</span><span class="unit">t/s</span></div>
+    <div class="sub" id="m-prefill-sub">instant (wall-clock)</div>
+  </div>
+  <div class="card" id="card-decode">
+    <div class="label">Decode Throughput</div>
+    <div><span class="value" id="m-decode">0</span><span class="unit">t/s</span></div>
+    <div class="sub" id="m-decode-sub">instant (wall-clock)</div>
+  </div>
+  <div class="card purple" id="card-tokens-in">
+    <div class="label">Tokens In</div>
+    <div><span class="value" id="m-tokens-in">0</span></div>
+    <div class="sub" id="m-tokens-in-sub">prompt tokens this interval</div>
+  </div>
+  <div class="card cyan" id="card-tokens-out">
+    <div class="label">Tokens Out</div>
+    <div><span class="value" id="m-tokens-out">0</span></div>
+    <div class="sub" id="m-tokens-out-sub">generated tokens this interval</div>
+  </div>
+  <div class="card cyan">
+    <div class="label">Generated (24h)</div>
+    <div><span class="value" id="m-gen-tok">—</span></div>
+    <div class="sub" id="m-gen-tok-sub">rolling 24h total</div>
+  </div>
+  <div class="card green" id="card-avg-prefill">
+    <div class="label">Avg Prefill (1h)</div>
+    <div><span class="value" id="m-avg-prefill">—</span><span class="unit">t/s</span></div>
+    <div class="sub" id="m-avg-prefill-sub">rolling 1h avg</div>
+  </div>
+  <div class="card blue" id="card-avg-decode">
+    <div class="label">Avg Decode (1h)</div>
+    <div><span class="value" id="m-avg-decode">—</span><span class="unit">t/s</span></div>
+    <div class="sub" id="m-avg-decode-sub">rolling 1h avg</div>
+  </div>
+  <div class="card orange">
+    <div class="label">Requests Processed</div>
+    <div><span class="value" id="m-req-proc">0</span></div>
+    <div class="sub" id="m-req-proc-sub">completed since monitor start</div>
+  </div>
+  <div class="card" id="card-gpu-temp">
+    <div class="label">GPU Temp</div>
+    <div><span class="value" id="m-gpu-temp">—</span><span class="unit">°C</span></div>
+  </div>
+</div>
+
+<!-- Charts -->
+<div class="charts">
+  <div class="chart-box">
+    <h3>📈 Instant Throughput (tokens/s) — shows activity per poll interval</h3>
+    <canvas id="chart-throughput"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>📊 Tokens Processed Per Interval</h3>
+    <canvas id="chart-delta-tokens"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>🔥 GPU Temperature (°C)</h3>
+    <canvas id="chart-temp"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>💾 GPU Memory Usage (MB)</h3>
+    <canvas id="chart-vram"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>⚡ GPU Utilization (%)</h3>
+    <canvas id="chart-gpu-util"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>🔋 Power Draw (W)</h3>
+    <canvas id="chart-power"></canvas>
+  </div>
+</div>
+
+<!-- GPU details -->
+<div class="model-bar" id="gpu-bar">
+  <div class="item"><span class="k">GPU:</span><span class="v" id="gpu-name">—</span></div>
+  <div class="item"><span class="k">VRAM:</span><span class="v" id="gpu-vram">—</span></div>
+  <div class="item"><span class="k">GPU Clock:</span><span class="v" id="gpu-clock">—</span></div>
+  <div class="item"><span class="k">Mem Clock:</span><span class="v" id="gpu-mem-clock">—</span></div>
+  <div class="item"><span class="k">Power:</span><span class="v" id="gpu-power">—</span></div>
+</div>
+
+<div class="footer">llama.cpp monitor · refreshes every 1s · <span id="footer-uptime">—</span></div>
+
+<script>
+// -----------------------------------------------------------------------
+// Chart helpers
+// -----------------------------------------------------------------------
+const WINDOW_MS = 5 * 60 * 1000;  // 5 minute sliding window
+
+const chartOpts = (yLabel, suggestedMax, stacked = false) => ({
+  responsive: true,
+  maintainAspectRatio: false,
+  animation: { duration: 0 },
+  interaction: { mode: 'index', intersect: false },
+  plugins: {
+    legend: { display: true, labels: { color: '#8b949e', font: { size: 11 } } },
+    tooltip: { backgroundColor: '#161b22', borderColor: '#30363d', borderWidth: 1 },
+  },
+  scales: {
+    x: {
+      type: 'time', time: { unit: 'second', tooltipFormat: 'HH:mm:ss', displayFormats: { second: 'HH:mm:ss', minute: 'HH:mm' } },
+      grid: { color: 'rgba(48,54,61,0.5)' }, ticks: { color: '#8b949e', maxTicksLimit: 10, source: 'auto' },
+    },
+    y: {
+      beginAtZero: true, suggestedMax,
+      stacked,
+      grid: { color: 'rgba(48,54,61,0.5)' }, ticks: { color: '#8b949e' },
+      title: { display: true, text: yLabel, color: '#8b949e' },
+    },
+  },
+});
+
+const makeDataset = (label, color, data = []) => ({
+  label, data, borderColor: color, backgroundColor: color + '22',
+  borderWidth: 2, pointRadius: 0, fill: true, tension: 0.3,
+});
+
+// Charts
+const chartThroughput = new Chart(document.getElementById('chart-throughput'), {
+  type: 'line',
+  data: {
+    datasets: [
+      makeDataset('Prefill t/s (instant)', '#3fb950'),
+      makeDataset('Decode t/s (instant)', '#58a6ff'),
+    ],
+  },
+  options: chartOpts('tokens/s', 3000),
+});
+
+const chartDeltaTokens = new Chart(document.getElementById('chart-delta-tokens'), {
+  type: 'bar',
+  data: {
+    datasets: [
+      { label: 'Prompt tokens', data: [], backgroundColor: '#bc8cff88', borderColor: '#bc8cff', borderWidth: 1 },
+      { label: 'Generated tokens', data: [], backgroundColor: '#39d2c088', borderColor: '#39d2c0', borderWidth: 1 },
+    ],
+  },
+  options: chartOpts('tokens/interval', undefined, true),
+});
+
+const chartTemp = new Chart(document.getElementById('chart-temp'), {
+  type: 'line',
+  data: { datasets: [makeDataset('Temperature °C', '#f85149')] },
+  options: chartOpts('°C', 80),
+});
+
+const chartVram = new Chart(document.getElementById('chart-vram'), {
+  type: 'line',
+  data: { datasets: [makeDataset('VRAM Used MB', '#bc8cff')] },
+  options: chartOpts('MB', 16384),
+});
+
+const chartGpuUtil = new Chart(document.getElementById('chart-gpu-util'), {
+  type: 'line',
+  data: { datasets: [makeDataset('GPU Util %', '#d29922')] },
+  options: chartOpts('%', 100),
+});
+
+const chartPower = new Chart(document.getElementById('chart-power'), {
+  type: 'line',
+  data: { datasets: [makeDataset('Power W', '#39d2c0')] },
+  options: chartOpts('W', 200),
+});
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+function fmt(n, d = 0) {
+  if (n == null || isNaN(n)) return '—';
+  return Number(n).toLocaleString(undefined, { maximumFractionDigits: d });
+}
+
+// -----------------------------------------------------------------------
+// Value hold: keep last non-zero value visible for 20 seconds
+// -----------------------------------------------------------------------
+const HOLD_MS = 20000;
+const holdState = {};  // { key: { value, lastNonZero } }
+
+function holdValue(key, newValue) {
+  const now = Date.now();
+  if (!holdState[key]) holdState[key] = { value: 0, lastNonZero: 0 };
+
+  if (newValue > 0) {
+    holdState[key].value = newValue;
+    holdState[key].lastNonZero = now;
+    return newValue;
+  }
+
+  // newValue is 0 — check if hold window still active
+  if (holdState[key].value > 0 && (now - holdState[key].lastNonZero) < HOLD_MS) {
+    return holdState[key].value;  // still within hold window
+  }
+
+  // Hold expired
+  holdState[key].value = 0;
+  return 0;
+}
+
+// -----------------------------------------------------------------------
+// Fetch + render
+// -----------------------------------------------------------------------
+let startTime = Date.now();
+
+async function refresh() {
+  try {
+    const [statusRes, historyRes] = await Promise.all([
+      fetch('/api/status'), fetch('/api/history'),
+    ]);
+    const status = await statusRes.json();
+    const hist = await historyRes.json();
+
+    // --- Activity badge (big, prominent) ---
+    const abadge = document.getElementById('activity-badge');
+    const aicon = document.getElementById('activity-icon');
+    const atxt = document.getElementById('activity-text');
+    const d = status.deltas || {};
+
+    if (!status.health_ok) {
+      abadge.className = 'activity-badge error';
+      aicon.textContent = '✖'; atxt.textContent = 'OFFLINE';
+    } else if (d.busy) {
+      abadge.className = 'activity-badge busy';
+      aicon.textContent = '▶'; atxt.textContent = 'PROCESSING';
+    } else {
+      abadge.className = 'activity-badge idle';
+      aicon.textContent = '⏸'; atxt.textContent = 'IDLE';
+    }
+
+    // --- Health badge ---
+    const badge = document.getElementById('status-badge');
+    const dot = document.getElementById('status-dot');
+    const stxt = document.getElementById('status-text');
+    if (status.health_ok) {
+      badge.className = 'status-badge ok'; dot.className = 'status-dot ok'; stxt.textContent = 'Healthy';
+    } else {
+      badge.className = 'status-badge err'; dot.className = 'status-dot err'; stxt.textContent = 'Unhealthy';
+    }
+    document.getElementById('last-update').textContent = 'Updated ' + new Date(status.ts_iso).toLocaleTimeString();
+
+    // --- Metric cards (show INSTANT throughput, not lifetime average) ---
+    const prefillCard = document.getElementById('card-prefill');
+    const decodeCard = document.getElementById('card-decode');
+
+    const heldPrefill = holdValue('prefill', d.instant_prefill_tps || 0);
+    const heldDecode = holdValue('decode', d.instant_decode_tps || 0);
+    const heldTokensIn = holdValue('tok_in', d.delta_prompt_tokens || 0);
+    const heldTokensOut = holdValue('tok_out', d.delta_gen_tokens || 0);
+
+    setVal('m-prefill', fmt(heldPrefill, 1));
+    setVal('m-decode', fmt(heldDecode, 1));
+
+    // Dim the card when idle, color when active
+    prefillCard.className = 'card' + (heldPrefill > 0 ? ' green' : ' dim');
+    decodeCard.className = 'card' + (heldDecode > 0 ? ' blue' : ' dim');
+
+    // Tokens In / Out cards with hold
+    const tokInCard = document.getElementById('card-tokens-in');
+    const tokOutCard = document.getElementById('card-tokens-out');
+    setVal('m-tokens-in', heldTokensIn);
+    setVal('m-tokens-out', heldTokensOut);
+    tokInCard.className = 'card' + (heldTokensIn > 0 ? ' purple' : ' dim');
+    tokOutCard.className = 'card' + (heldTokensOut > 0 ? ' cyan' : ' dim');
+    document.getElementById('m-tokens-in-sub').textContent =
+      heldTokensIn > 0 ? `${d.delta_prompt_tokens || 0} prompt tokens` : 'prompt tokens this interval';
+    document.getElementById('m-tokens-out-sub').textContent =
+      heldTokensOut > 0 ? `${d.delta_gen_tokens || 0} generated tokens` : 'generated tokens this interval';
+
+    const m = status.metrics || {};
+    // 24h generated tokens from rolling window
+    setVal('m-gen-tok', fmt(status.generated_24h));
+    const genCard = document.getElementById('m-gen-tok').parentElement.parentElement;
+    genCard.className = 'card' + ((status.generated_24h || 0) > 0 ? ' cyan' : ' dim');
+    setVal('m-req-proc', fmt(status.requests_processed_total));
+    const reqDelta = status.delta_requests_processed || 0;
+    document.getElementById('m-req-proc-sub').textContent =
+      reqDelta > 0 ? `+${reqDelta} this interval` : 'completed since monitor start';
+
+    // --- 1-hour rolling averages ---
+    const avgs = status.averages || {};
+    setVal('m-avg-prefill', fmt(avgs.avg_prefill_1h, 1));
+    setVal('m-avg-decode', fmt(avgs.avg_decode_1h, 1));
+    const avgPreCard = document.getElementById('card-avg-prefill');
+    const avgDecCard = document.getElementById('card-avg-decode');
+    avgPreCard.className = 'card' + (avgs.avg_prefill_1h > 0 ? ' green' : ' dim');
+    avgDecCard.className = 'card' + (avgs.avg_decode_1h > 0 ? ' blue' : ' dim');
+    document.getElementById('m-avg-prefill-sub').textContent =
+      avgs.prefill_samples ? `${avgs.prefill_samples} samples / ${fmt(avgs.window_seconds)}s` : 'no data yet';
+    document.getElementById('m-avg-decode-sub').textContent =
+      avgs.decode_samples ? `${avgs.decode_samples} samples / ${fmt(avgs.window_seconds)}s` : 'no data yet';
+
+    // GPU
+    const g = status.gpu || {};
+    if (!g.error) {
+      setVal('m-gpu-temp', fmt(g.temperature_c));
+      const tempCard = document.getElementById('card-gpu-temp');
+      tempCard.className = 'card' + (g.temperature_c >= 80 ? ' red' : g.temperature_c >= 65 ? ' orange' : ' green');
+
+      document.getElementById('info-gpu').textContent = g.name || '—';
+      document.getElementById('info-vram').textContent = `${fmt(g.vram_used_mb)} / ${fmt(g.vram_total_mb)} MB`;
+      document.getElementById('gpu-name').textContent = g.name || '—';
+      document.getElementById('gpu-vram').textContent = `${fmt(g.vram_used_mb)} / ${fmt(g.vram_total_mb)} MB`;
+      document.getElementById('gpu-clock').textContent = `${fmt(g.clock_graphics_mhz)} MHz`;
+      document.getElementById('gpu-mem-clock').textContent = `${fmt(g.clock_memory_mhz)} MHz`;
+      document.getElementById('gpu-power').textContent = `${fmt(g.power_w, 1)} W`;
+    }
+
+    // --- History → charts (5-minute sliding window) ---
+    const pts = hist.points || [];
+    const times = pts.map(p => new Date(p.ts_iso));
+    const now = Date.now();
+    const windowMin = new Date(now - WINDOW_MS);
+    const windowMax = new Date(now);
+
+    // Apply sliding window to all time-axis charts
+    function slideWindow(chart) {
+      chart.options.scales.x.min = windowMin;
+      chart.options.scales.x.max = windowMax;
+    }
+
+    // Instant throughput chart (from deltas)
+    slideWindow(chartThroughput);
+    chartThroughput.data.datasets[0].data = pts.map((p, i) => ({
+      x: times[i], y: p.deltas?.instant_prefill_tps ?? 0
+    }));
+    chartThroughput.data.datasets[1].data = pts.map((p, i) => ({
+      x: times[i], y: p.deltas?.instant_decode_tps ?? 0
+    }));
+    chartThroughput.update('none');
+
+    // Delta tokens bar chart
+    slideWindow(chartDeltaTokens);
+    chartDeltaTokens.data.datasets[0].data = pts.map((p, i) => ({
+      x: times[i], y: p.deltas?.delta_prompt_tokens ?? 0
+    }));
+    chartDeltaTokens.data.datasets[1].data = pts.map((p, i) => ({
+      x: times[i], y: p.deltas?.delta_gen_tokens ?? 0
+    }));
+    chartDeltaTokens.update('none');
+
+    // GPU charts
+    slideWindow(chartTemp);
+    chartTemp.data.datasets[0].data = pts.map((p, i) => ({ x: times[i], y: p.gpu?.temperature_c ?? null }));
+    chartTemp.update('none');
+
+    slideWindow(chartVram);
+    chartVram.data.datasets[0].data = pts.map((p, i) => ({ x: times[i], y: p.gpu?.vram_used_mb ?? null }));
+    chartVram.update('none');
+
+    slideWindow(chartGpuUtil);
+    chartGpuUtil.data.datasets[0].data = pts.map((p, i) => ({ x: times[i], y: p.gpu?.gpu_util_pct ?? null }));
+    chartGpuUtil.update('none');
+
+    slideWindow(chartPower);
+    chartPower.data.datasets[0].data = pts.map((p, i) => ({ x: times[i], y: p.gpu?.power_w ?? null }));
+    chartPower.update('none');
+
+    // Uptime
+    const upSec = Math.floor((Date.now() - startTime) / 1000);
+    const h = Math.floor(upSec / 3600), m2 = Math.floor((upSec % 3600) / 60), s = upSec % 60;
+    document.getElementById('footer-uptime').textContent = `monitor up ${h}h ${m2}m ${s}s`;
+
+  } catch (e) {
+    console.error('refresh error', e);
+  }
+}
+
+function setVal(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+
+// Load props once
+async function loadProps() {
+  try {
+    const r = await fetch('/api/props');
+    const p = await r.json();
+    if (p.model_alias) {
+      document.getElementById('model-name').textContent = p.model_alias;
+      document.getElementById('info-model').textContent = p.model_alias;
+    }
+    if (p.default_generation_settings?.n_ctx)
+      document.getElementById('info-ctx').textContent = fmt(p.default_generation_settings.n_ctx);
+    if (p.total_slots != null)
+      document.getElementById('info-slots').textContent = p.total_slots;
+  } catch (e) {}
+}
+
+loadProps();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

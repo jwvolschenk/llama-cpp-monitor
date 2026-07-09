@@ -1,0 +1,2 @@
+# CodeDB config for llama-cpp-monitor (not a git repo).
+require_git_repo = false

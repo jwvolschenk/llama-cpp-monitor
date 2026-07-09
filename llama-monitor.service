@@ -1,0 +1,19 @@
+[Unit]
+Description=Llama.cpp Server Monitor Dashboard
+After=llama-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/jwvolschenk/repos/llama-cpp-monitor/monitor.py
+WorkingDirectory=/home/jwvolschenk/repos/llama-cpp-monitor
+Environment=LLAMA_HOST=localhost
+Environment=LLAMA_PORT=8080
+Environment=MONITOR_PORT=8100
+Environment=GPU_INDEX=1
+Environment=HISTORY_HOUR_MAX=3600
+Environment=HISTORY_24H_MAX=86400
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
